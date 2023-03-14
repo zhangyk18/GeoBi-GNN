@@ -162,7 +162,7 @@ if __name__ == "__main__":
     opt.params_path = R"D:\code\python\3d\denoising\GeoBi-GNN\log\GeoBi-GNN_Kinect_Fusion_debug\20230314-141926\GeoBi-GNN_Kinect_Fusion_params.pth"
     # opt.data_dir = R"E:\code\python\denoising\TempNet\GanzangZhongliu\obj\noisy"
     # opt.data_dir = unicode(opt.data_dir, 'utf-8')
-    opt.sub_size = 15000
+    opt.sub_size = 20000
     opt.gpu = 1
 
     predict_dir(opt.params_path, data_dir=opt.data_dir, sub_size=opt.sub_size, gpu=opt.gpu)

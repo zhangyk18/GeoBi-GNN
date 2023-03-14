@@ -296,11 +296,3 @@ if __name__ == "__main__":
 
     from test_dual import predict_dir
     predict_dir(params_file, data_dir=None, sub_size=opt.sub_size, gpu=opt.gpu)
-
-    input_re = [0, 1, 2, 3]
-    lr = [0.005, 0.002, 0.001, 0.0005]
-    batch_size = [2, 4, 5]
-
-    lr_step = [50, 60, 80]
-    lr_decay = [0.8, 0.5, 0.2, 0.1]
-    wei_decay = [0.001, 0.0005, 0.0001, 0.00005, 0.00001]
