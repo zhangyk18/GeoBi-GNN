@@ -1,26 +1,17 @@
-import os
-import sys
-import glob
-import argparse
+# -*- coding: utf-8 -*-
+import os, sys, glob, argparse
 from datetime import datetime
 import numpy as np
 import openmesh as om
 import torch
 import data_util
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, 'data')
+
+CODE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(CODE_DIR)
+DATASET_DIR = os.path.join(BASE_DIR, 'dataset')
 LOG_DIR = os.path.join(BASE_DIR, 'log')
-
-
-def is_debug():
-    gettrace = getattr(sys, 'gettrace', None)
-    if gettrace is None:
-        return False
-    elif gettrace():
-        return True
-    else:
-        return False
+IS_DEBUG = getattr(sys, 'gettrace', None) is not None and sys.gettrace()
 
 
 # ================================================== train =====================================================
@@ -35,7 +26,6 @@ def predict_one(opt, net, device, filename, rst_filename=None, filename_gt=None)
     from dataset import DualDataset
     from network import error_n
 
-    time_start = datetime.now()
     # 1.load data
     mesh_noisy = om.read_trimesh(filename)
     points_noisy = mesh_noisy.points().astype(np.float32)
@@ -44,81 +34,61 @@ def predict_one(opt, net, device, filename, rst_filename=None, filename_gt=None)
     # if mesh_noisy.n_faces() > 30000:
     #     return
 
-    # 2.center and scal
-    _, centroid, scale = data_util.center_and_scale(points_noisy, mesh_noisy.edge_vertex_indices())
+    time_start = datetime.now()
 
-    # 3.split to submeshes and inference
-    if mesh_noisy.n_faces() <= opt.sub_size:
-        dual_data = DualDataset.process_one_submesh(mesh_noisy)
-        dual_data[0].centroid = torch.from_numpy(centroid).float()
-        dual_data[0].scale = scale
-        dual_data = DualDataset.post_processing(dual_data, opt.data_type, True)
+    # 2.process entire mesh
+    all_data = DualDataset.process_one_data(filename, opt.sub_size, filename_gt)
+    centroid = all_data[0][0][0].centroid
+    scale = all_data[0][0][0].scale
+    print(F"---------- time: {(datetime.now()-time_start).total_seconds():7.4f} s")
+
+    # 3.inference
+    time_start1 = datetime.now()
+    if len(all_data) == 1:
+        dual_data = all_data[0][0]
+        dual_data = DualDataset.post_processing(dual_data, opt.data_type)
         Vp, Np = predict_one_submesh(net, device, dual_data)
     else:
-        # mesh_noisy.update_face_normals()
-        # Nn = mesh_noisy.face_normals().astype(np.float32)
-
+        sum_v = torch.zeros((mesh_noisy.n_vertices(), 1), dtype=torch.int8, device=device)
         Vp = torch.zeros((mesh_noisy.n_vertices(), 3), dtype=torch.float32, device=device)
         Np = torch.zeros((mesh_noisy.n_faces(), 3), dtype=torch.float32, device=device)
-        sum_v = torch.zeros((Vp.shape[0], 1), dtype=torch.int8, device=device)
 
-        flag_f = np.zeros(Np.shape[0], dtype=np.bool)
-        fv_indices = mesh_noisy.fv_indices()
-        vf_indices = mesh_noisy.vf_indices()
-        face_cent = points_noisy[fv_indices].mean(1)
-
-        seed = np.argmax(((face_cent - centroid)**2).sum(1))
-        for sub_num in range(1, sys.maxsize):
-            # select patch facet indices
-            select_faces = data_util.mesh_get_neighbor_np(fv_indices, vf_indices, seed, neighbor_count=opt.sub_size)
-            flag_f.put(select_faces, True)
-
-            # split submesh based on facet indices
-            V_idx, F = data_util.get_submesh(fv_indices, select_faces)
-            sum_v[V_idx] += 1
-
-            # to Data
-            submesh_n = om.TriMesh(points_noisy[V_idx], F)
-            dual_data = DualDataset.process_one_submesh(submesh_n)
-            dual_data[0].centroid = torch.from_numpy(centroid).float()
-            dual_data[0].scale = scale
-            dual_data = DualDataset.post_processing(dual_data, opt.data_type, True)
+        for dual_data, V_idx, F_idx in all_data:
+            dual_data = DualDataset.post_processing(dual_data, opt.data_type)
             vert_p, norm_p = predict_one_submesh(net, device, dual_data)
+            sum_v[V_idx] += 1
             Vp[V_idx] += vert_p
-            Np[select_faces] += norm_p
+            Np[F_idx] += norm_p
 
-            # whether all facets have been visited, next seed
-            left_idx = np.where(~flag_f)[0]
-            if left_idx.size:
-                idx_temp = np.argmax(((face_cent[left_idx] - centroid)**2).sum(1))
-                seed = left_idx[idx_temp]
-            else:
-                break
         Vp /= sum_v
         Np = torch.nn.functional.normalize(Np, dim=1)
 
-    # 4.update position and save
     Vp = Vp.cpu() / scale + centroid
-    if mesh_noisy.n_faces() > opt.sub_size:
-        nan_idx = (sum_v == 0).squeeze()
-        Vp[nan_idx] = torch.from_numpy(points_noisy)[nan_idx]
     Np = Np.cpu()
-    om.write_mesh(F"{rst_filename[:-4]}-v.obj", om.TriMesh(Vp.cpu().numpy(), mesh_noisy.fv_indices()))
+    # om.write_mesh(F"{rst_filename[:-4]}-V.obj", om.TriMesh(Vp.numpy(), mesh_noisy.fv_indices()))
 
+    # 4.update position and save
     fv_indices = torch.from_numpy(mesh_noisy.fv_indices()).long()
     vf_indices = torch.from_numpy(mesh_noisy.vf_indices()).long()
     depth_direction = None
-    if opt.data_type in ['Kinect_v1', 'Kinect_v2']:
-        depth_direction = torch.nn.functional.normalize(torch.from_numpy(points_noisy), dim=1)
-        # dd = torch.nn.functional.normalize(Vp, dim=1)
-    # n_iter=60 for Kinect_Fusion, refer to <<Mesh Denoising with Facet Graph Convolutions>>
-    V1 = data_util.update_position2(Vp, fv_indices, vf_indices, Np, 60, depth_direction=depth_direction)
-    # V2 = data_util.update_position(Vp, fv_indices, vf_indices, Np, 60, depth_direction=depth_direction)
-    # aa = torch.abs(V1-V2).max()
-    # print(F"{aa:.4f}")
+    # if opt.data_type in ['Kinect_v1', 'Kinect_v2']:
+    #     depth_direction = torch.nn.functional.normalize(torch.from_numpy(points_noisy), dim=1)
+    V = data_util.update_position2(Vp, fv_indices, vf_indices, Np, 60, depth_direction=depth_direction)
+    om.write_mesh(F"{rst_filename[:-4]}-60.obj", om.TriMesh(V.numpy(), mesh_noisy.fv_indices()))
 
-    # om.write_mesh(F"{rst_filename[:-4]}-v.obj", om.TriMesh(Vp.numpy(), mesh_noisy.fv_indices()))
-    om.write_mesh(rst_filename, om.TriMesh(V1.numpy(), mesh_noisy.fv_indices()))
+    print(F"---------- time: {(datetime.now()-time_start1).total_seconds():7.4f} s")
+
+    # V = data_util.update_position2(Vp, fv_indices, vf_indices, Np, 20, depth_direction=depth_direction)
+    # om.write_mesh(F"{rst_filename[:-4]}-20.obj", om.TriMesh(V.numpy(), mesh_noisy.fv_indices()))
+    # V = data_util.update_position2(Vp, fv_indices, vf_indices, Np, 25, depth_direction=depth_direction)
+    # om.write_mesh(F"{rst_filename[:-4]}-25.obj", om.TriMesh(V.numpy(), mesh_noisy.fv_indices()))
+
+    # V1 = data_util.update_position2(torch.from_numpy(points_noisy), fv_indices, vf_indices, Np, 60, depth_direction=depth_direction)
+    # om.write_mesh(F"{rst_filename[:-4]}-60-UpNoi.obj", om.TriMesh(V1.numpy(), mesh_noisy.fv_indices()))
+    # V1 = data_util.update_position2(torch.from_numpy(points_noisy), fv_indices, vf_indices, Np, 20, depth_direction=depth_direction)
+    # om.write_mesh(F"{rst_filename[:-4]}-20-UpNoi.obj", om.TriMesh(V1.numpy(), mesh_noisy.fv_indices()))
+    # V1 = data_util.update_position2(torch.from_numpy(points_noisy), fv_indices, vf_indices, Np, 25, depth_direction=depth_direction)
+    # om.write_mesh(F"{rst_filename[:-4]}-25-UpNoi.obj", om.TriMesh(V1.numpy(), mesh_noisy.fv_indices()))
 
     angle1 = angle2 = 0
     if filename_gt is not None:
@@ -172,10 +142,10 @@ def predict_dir(params_path, data_dir=None, sub_size=None, gpu=-1):
 
     sys.path.insert(0, bak_dir)
     import network
-    net = network.DualGNN(
-        force_depth=opt.force_depth, include_facet_initial_feature=opt.include_facet_initial_feature,
-        pool_type=opt.pool_type, pool_step=2, edge_weight_type=opt.wei_type, learn_res=opt.learn_res)
-    # net = network.DualGNN_Fusion(force_depth=opt.force_depth, pool_type=opt.pool_type, pool_step=2, edge_weight_type=opt.wei_type)
+    if hasattr(opt, 'wei_param'):
+        net = network.DualGNN(force_depth=opt.force_depth, pool_type=opt.pool_type, edge_weight_type=opt.wei_type, wei_param=opt.wei_param)
+    else:
+        net = network.DualGNN(force_depth=opt.force_depth, pool_type=opt.pool_type, edge_weight_type=opt.wei_type)
     net.load_state_dict(torch.load(os.path.join(bak_dir, opt.model_name)))
     net = net.to(device)
     net.eval()
@@ -186,8 +156,8 @@ def predict_dir(params_path, data_dir=None, sub_size=None, gpu=-1):
         rst_file = os.path.join(result_dir, os.path.basename(noisy_file))
         # if os.path.exists(rst_file):
         #     continue
-        if 'joint_n3' not in noisy_file:
-            continue
+        # if 'joint_n3' not in noisy_file:
+        #     continue
         angle1, angle2, count = predict_one(opt, net, device, noisy_file, rst_file, None if len(filenames_gt) == 0 else filenames_gt[i])
         error_all[0, i] = count
         error_all[1, i] = angle1
@@ -210,15 +180,16 @@ if __name__ == "__main__":
     parser.add_argument('--gpu', type=int, default=-1, help='gpu index')
     opt = parser.parse_args()
 
-    if is_debug():
-        opt.params_path = R"E:\code\python\denoising\TempNet\log\Bi-GNN_Synthetic_abla\20210309-145738\Bi-GNN_Synthetic_params.pth"
-        # opt.data_dir = R"E:\data\dataset\Biwi_Kinect_Head_Pose-Database\02\mesh"
-        opt.sub_size = 100000
-        opt.gpu = 1
+    # if is_debug():
+    opt.params_path = R"E:\code\python\denoising\TempNet\log\Bi-GNN_Synthetic_1002_time\20211002-220224\Bi-GNN_Synthetic_params.pth"
+    opt.data_dir = R"E:\code\python\denoising\TempNet\GanzangZhongliu\obj\noisy"
+    # opt.data_dir = unicode(opt.data_dir, 'utf-8')
+    opt.sub_size = 15000
+    opt.gpu = 1
 
     predict_dir(opt.params_path, data_dir=opt.data_dir, sub_size=opt.sub_size, gpu=opt.gpu)
 
     # python test_dual.py --params_path=  --original_dir=  --gpu=  --sub_size=
 
     # download data from server via SSH
-    # scp -r -P 25180 zyk@10.10.1.150:[source_path] [local_path]
+    # scp -r -P 25454 zyk@10.10.1.150:[source_path] [local_path]

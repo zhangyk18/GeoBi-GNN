@@ -8,7 +8,7 @@ import torch
 from torch_scatter import scatter
 from torch_sparse import coalesce
 # from hausdorff import hausdorff_distance
-import my_hausdorff
+# import my_hausdorff
 import matplotlib.pyplot as plt
 try:
     from mayavi import mlab
@@ -445,7 +445,7 @@ def build_facet_graph(fv_indices, vf_indices):
     num_nodes = fv_indices.shape[0]
     num_neighbor = vf_indices.shape[1] * 3
 
-    edge_i, _ = torch.meshgrid(torch.arange(num_nodes), torch.arange(num_neighbor))
+    edge_i, _ = torch.meshgrid(torch.arange(num_nodes), torch.arange(num_neighbor), indexing='ij')
     edge_j = vf_indices[fv_indices, :]  # there are repetitive and invalid (i.e. -1) elements in each row of 'edge_j'
     edge_i = edge_i.flatten()
     edge_j = edge_j.flatten()
@@ -466,7 +466,7 @@ def build_edge_vf(vf_indices):
     num_nodes = vf_indices.shape[0]
     num_adjoinings = vf_indices.shape[1]
 
-    edge_i, _ = torch.meshgrid(torch.arange(num_nodes), torch.arange(num_adjoinings))
+    edge_i, _ = torch.meshgrid(torch.arange(num_nodes), torch.arange(num_adjoinings), indexing='ij')
     edge_i = edge_i.flatten()
     edge_j = vf_indices.flatten()  # there are and invalid (i.e. -1) elements in each row of 'edge_j'
 
@@ -481,7 +481,7 @@ def build_edge_fv(fv_indices):
     """
     num_faces = fv_indices.shape[0]
 
-    edge_i, _ = torch.meshgrid(torch.arange(num_faces), torch.arange(3))
+    edge_i, _ = torch.meshgrid(torch.arange(num_faces), torch.arange(3), indexing='ij')
     edge_i = edge_i.flatten()
     edge_j = fv_indices.flatten()
 
@@ -505,7 +505,7 @@ def update_position(points, fv_indices, vf_indices, face_normals, n_iter=20, dep
     n_vert = vf_indices.shape[0]
     n_adj_max = vf_indices.shape[1]
 
-    v_idx, _ = torch.meshgrid(torch.arange(n_vert), torch.arange(n_adj_max))
+    v_idx, _ = torch.meshgrid(torch.arange(n_vert), torch.arange(n_adj_max), indexing='ij')
     v_idx = v_idx.flatten()
     f_idx = vf_indices.flatten()
     valid_idx = torch.where(f_idx > -1)[0]  # remove invalid pairs (index==-1)

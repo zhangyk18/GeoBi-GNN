@@ -1,5 +1,4 @@
-import os
-import math
+import os, sys, math, random, argparse
 import torch
 from torch import nn
 import torch.utils.data
@@ -9,20 +8,23 @@ import torch_geometric
 from torch_scatter import scatter
 from torch_geometric.nn import GCNConv, FeaStConv
 from torch_geometric.utils import remove_self_loops
-import data_util
-from net_util import GACConv, pooling, pooling_run, PoolingLayer, AdaptiveLossWeight, batch_quat_to_rotmat, DualFusionLayer
 from torch_geometric.nn import GATConv
-from kaolin.metrics.pointcloud import sided_distance
-from kaolin.metrics.pointcloud import chamfer_distance
+# from kaolin.metrics.pointcloud import sided_distance
+# from kaolin.metrics.pointcloud import chamfer_distance
 try:
     from pytorch3d.ops.points_alignment import iterative_closest_point as icp
 except ImportError:
     icp = None
+import data_util
+from net_util import pooling, pooling_run, PoolingLayer, batch_quat_to_rotmat, DualFusionLayer
 
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, 'data')
+
+CODE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(CODE_DIR)
+DATASET_DIR = os.path.join(BASE_DIR, 'dataset')
 LOG_DIR = os.path.join(BASE_DIR, 'log')
+IS_DEBUG = getattr(sys, 'gettrace', None) is not None and sys.gettrace()
 
 
 class FacetAttentionGNN(torch.nn.Module):
@@ -341,228 +343,7 @@ class DualGNN(torch.nn.Module):
         return feat_v, F.normalize(feat_f, dim=1), None
 
 
-class SingleGNN(torch.nn.Module):
-    def __init__(self, out_type, force_depth=False, pool_type='max', pool_step=2, edge_weight_type=0):
-        super(SingleGNN, self).__init__()
-        assert (out_type in ['normal', 'vertex'])
-        self.out_type = out_type
-        self.force_depth = force_depth
-
-        self.gnn = GNNModule(6, pool_type, pool_step, edge_weight_type)  # out_channel = 32
-        self.fc_v1 = nn.Linear(32, 1024)
-        self.fc_v2 = nn.Linear(1024, 1) if self.force_depth else nn.Linear(1024, 3)
-
-        self.fc_mat = nn.Linear(1024, 4)
-
-    def forward(self, data):
-        if self.out_type == 'vertex':
-            x_init = data.x[:, :3]
-        elif self.out_type == 'normal':
-            x_init = data.x[:, 3:6]
-
-        feat = self.gnn(data)
-        feat = F.leaky_relu(self.fc_v1(feat), 0.2, inplace=True)
-
-        quat = feat.max(0)[0].unsqueeze(0)
-        quat = self.fc_mat(quat)
-        quat = quat + quat.new_tensor([1, 0, 0, 0])
-        quat = F.normalize(quat, dim=1)
-        mat = batch_quat_to_rotmat(quat, normalize=False)
-
-        feat = self.fc_v2(feat)
-        if self.force_depth:  # constrain coordinate in the depth direction of original coordinate frame
-            feat = feat * data.depth_direction
-        feat += x_init
-
-        if self.out_type == 'vertex':
-            feat = torch.bmm(feat.unsqueeze(0), mat).squeeze()
-            return feat
-        elif self.out_type == 'normal':
-            return F.normalize(feat, dim=1)
-
-
 # ---------------------------------------------------------------------------
-class DualLinear(torch.nn.Module):
-    def __init__(self, in_channel, out_channel):
-        super(DualLinear, self).__init__()
-
-        self.lin_v = nn.Linear(in_channel, out_channel)
-        self.lin_f = nn.Linear(in_channel, out_channel)
-
-    def forward(self, data_v, data_f):
-        feat_v = F.leaky_relu(self.lin_v(data_v.x), 0.2, inplace=True)
-        feat_f = F.leaky_relu(self.lin_f(data_f.x), 0.2, inplace=True)
-        return feat_v, feat_f
-
-
-class DualConv(torch.nn.Module):
-    def __init__(self, in_channel, out_channel, head):
-        super(DualConv, self).__init__()
-
-        self.conv_v = FeaStConv(in_channel, out_channel, head)
-        self.conv_f = FeaStConv(in_channel, out_channel, head)
-
-    def forward(self, data_v, data_f):
-        data_v.x = F.leaky_relu(self.conv_v(data_v.x, data_v.edge_index), 0.2, inplace=True)
-        data_f.x = F.leaky_relu(self.conv_f(data_f.x, data_f.edge_index), 0.2, inplace=True)
-        return data_v, data_f
-
-
-class DualPooling(torch.nn.Module):
-    def __init__(self, in_channel, pool_type='max', pool_step=2, edge_weight_type=0):
-        super(DualPooling, self).__init__()
-
-        self.pool_v = PoolingLayer(in_channel, pool_type, pool_step, edge_weight_type)
-        self.pool_f = PoolingLayer(in_channel, pool_type, pool_step, edge_weight_type)
-
-    def forward(self, data_v, data_f):
-        data_v = self.pool_v(data_v)
-        data_f = self.pool_f(data_f)
-        return data_v, data_f
-
-    def unpooling(self, data_v, data_f):
-        feat_v = self.pool_v.unpooling(data_v.x)
-        feat_f = self.pool_f.unpooling(data_f.x)
-        return feat_v, feat_f
-
-
-class DualGNN_Fusion(torch.nn.Module):
-    def __init__(self, force_depth=False, pool_type='max', pool_step=2, edge_weight_type=0):
-        super(DualGNN_Fusion, self).__init__()
-        self.force_depth = force_depth
-
-        self.lin_in = DualLinear(6, 32)
-
-        self.dual_conv_l1 = DualConv(32, 32, 9)
-        self.dual_pool1 = DualPooling(32, pool_type, pool_step, edge_weight_type)
-        self.dual_conv_l2 = DualConv(32, 64, 9)
-        self.dual_pool2 = DualPooling(64, pool_type, pool_step, edge_weight_type)
-        self.dual_conv_l3 = DualConv(64, 128, 9)
-
-        self.dual_conv_r3 = DualConv(128, 64, 9)
-        self.dual_conv_r2 = DualConv(128, 32, 9)
-        self.dual_conv_r1 = DualConv(64, 32, 9)
-
-        self.fusion3 = DualFusionLayer(64)
-        self.fusion2 = DualFusionLayer(32)
-        self.fusion1 = DualFusionLayer(32)
-
-        self.dual_conv_out = DualConv(32, 32, 9)
-        self.lin_out1 = DualLinear(32, 512)
-        self.lin_out_v = nn.Linear(512, 3)
-        self.lin_out_f = nn.Linear(512, 3)
-
-    def forward(self, dual_data):
-        data_v_r1, data_f_r1 = dual_data
-        xyz = data_v_r1.x[:, :3]
-        nf = data_f_r1.x[:, 3:6]
-
-        data_v_r1.x, data_f_r1.x = self.lin_in(data_v_r1, data_f_r1)
-
-        data_v_r1, data_f_r1 = self.dual_conv_l1(data_v_r1, data_f_r1)
-        data_v_r2, data_f_r2 = self.dual_pool1(data_v_r1, data_f_r1)
-        data_v_r2, data_f_r2 = self.dual_conv_l2(data_v_r2, data_f_r2)
-        data_v_r3, data_f_r3 = self.dual_pool2(data_v_r2, data_f_r2)
-        data_v_r3, data_f_r3 = self.dual_conv_l3(data_v_r3, data_f_r3)
-
-        data_v_r3, data_f_r3 = self.dual_conv_r3(data_v_r3, data_f_r3)
-        data_v_r3.x, data_f_r3.x = self.fusion3(data_v_r3, data_f_r3)
-
-        feat_v_r2, feat_f_r2 = self.dual_pool2.unpooling(data_v_r3, data_f_r3)
-        data_v_r2.x = torch.cat((data_v_r2.x, feat_v_r2), 1)
-        data_f_r2.x = torch.cat((data_f_r2.x, feat_f_r2), 1)
-        data_v_r2, data_f_r2 = self.dual_conv_r2(data_v_r2, data_f_r2)
-        data_v_r2.x, data_f_r2.x = self.fusion2(data_v_r2, data_f_r2)
-
-        feat_v_r1, feat_f_r1 = self.dual_pool1.unpooling(data_v_r2, data_f_r2)
-        data_v_r1.x = torch.cat((data_v_r1.x, feat_v_r1), 1)
-        data_f_r1.x = torch.cat((data_f_r1.x, feat_f_r1), 1)
-        data_v_r1, data_f_r1 = self.dual_conv_r1(data_v_r1, data_f_r1)
-        data_v_r1.x, data_f_r1.x = self.fusion1(data_v_r1, data_f_r1)
-
-        data_v_r1, data_f_r1 = self.dual_conv_out(data_v_r1, data_f_r1)
-        feat_v, feat_f = self.lin_out1(data_v_r1, data_f_r1)
-        feat_v = self.lin_out_v(feat_v)
-        feat_f = self.lin_out_f(feat_f)
-
-        feat_v += xyz
-        feat_f += nf
-        return feat_v, F.normalize(feat_f, dim=1), None
-
-
-class DualGNN_Fusion_temp(torch.nn.Module):
-    def __init__(self, force_depth=False, pool_type='max', pool_step=2, edge_weight_type=0):
-        super(DualGNN_Fusion_temp, self).__init__()
-        self.force_depth = force_depth
-
-        self.lin_in = DualLinear(6, 32)
-
-        self.dual_conv_l1 = DualConv(32, 32, 9)
-        self.dual_pool1 = DualPooling(32, pool_type, pool_step, edge_weight_type)
-        self.dual_conv_l2 = DualConv(32, 64, 9)
-        self.dual_pool2 = DualPooling(64, pool_type, pool_step, edge_weight_type)
-        self.dual_conv_l3 = DualConv(64, 128, 9)
-
-        self.fusion_l1 = DualFusionLayer(32)
-        self.fusion_l2 = DualFusionLayer(64)
-        self.fusion_l3 = DualFusionLayer(128)
-
-        self.dual_conv_r3 = DualConv(128, 64, 9)
-        self.dual_conv_r2 = DualConv(128, 32, 9)
-        self.dual_conv_r1 = DualConv(64, 32, 9)
-
-        self.fusion_r3 = DualFusionLayer(64)
-        self.fusion_r2 = DualFusionLayer(32)
-        self.fusion_r1 = DualFusionLayer(32)
-
-        self.dual_conv_out = DualConv(32, 32, 9)
-        self.lin_out1 = DualLinear(32, 512)
-        self.lin_out_v = nn.Linear(512, 3)
-        self.lin_out_f = nn.Linear(512, 3)
-
-    def forward(self, dual_data):
-        data_v_r1, data_f_r1 = dual_data
-        xyz = data_v_r1.x[:, :3]
-        nf = data_f_r1.x[:, 3:6]
-
-        data_v_r1.x, data_f_r1.x = self.lin_in(data_v_r1, data_f_r1)
-
-        data_v_r1, data_f_r1 = self.dual_conv_l1(data_v_r1, data_f_r1)
-        data_v_r1.x, data_f_r1.x = self.fusion_l1(data_v_r1, data_f_r1)
-
-        data_v_r2, data_f_r2 = self.dual_pool1(data_v_r1, data_f_r1)
-        data_v_r2, data_f_r2 = self.dual_conv_l2(data_v_r2, data_f_r2)
-        data_v_r2.x, data_f_r2.x = self.fusion_l2(data_v_r2, data_f_r2)
-
-        data_v_r3, data_f_r3 = self.dual_pool2(data_v_r2, data_f_r2)
-        data_v_r3, data_f_r3 = self.dual_conv_l3(data_v_r3, data_f_r3)
-        data_v_r3.x, data_f_r3.x = self.fusion_l3(data_v_r3, data_f_r3)
-
-        data_v_r3, data_f_r3 = self.dual_conv_r3(data_v_r3, data_f_r3)
-        data_v_r3.x, data_f_r3.x = self.fusion_r3(data_v_r3, data_f_r3)
-
-        feat_v_r2, feat_f_r2 = self.dual_pool2.unpooling(data_v_r3, data_f_r3)
-        data_v_r2.x = torch.cat((data_v_r2.x, feat_v_r2), 1)
-        data_f_r2.x = torch.cat((data_f_r2.x, feat_f_r2), 1)
-        data_v_r2, data_f_r2 = self.dual_conv_r2(data_v_r2, data_f_r2)
-        data_v_r2.x, data_f_r2.x = self.fusion_r2(data_v_r2, data_f_r2)
-
-        feat_v_r1, feat_f_r1 = self.dual_pool1.unpooling(data_v_r2, data_f_r2)
-        data_v_r1.x = torch.cat((data_v_r1.x, feat_v_r1), 1)
-        data_f_r1.x = torch.cat((data_f_r1.x, feat_f_r1), 1)
-        data_v_r1, data_f_r1 = self.dual_conv_r1(data_v_r1, data_f_r1)
-        data_v_r1.x, data_f_r1.x = self.fusion_r1(data_v_r1, data_f_r1)
-
-        data_v_r1, data_f_r1 = self.dual_conv_out(data_v_r1, data_f_r1)
-        feat_v, feat_f = self.lin_out1(data_v_r1, data_f_r1)
-        feat_v = self.lin_out_v(feat_v)
-        feat_f = self.lin_out_f(feat_f)
-
-        feat_v += xyz
-        feat_f += nf
-        return feat_v, F.normalize(feat_f, dim=1), None
-
-
 def _laplacian(v, edge_idx_v, normal=None):
     row, col = edge_idx_v
     edge = v[row] - v[col]
@@ -639,11 +420,6 @@ if __name__ == "__main__":
     data_file = R"E:\code\python\denoising\TempNet\data\Synthetic\train\processed_data\Cylinder_n2.pt"
     dual_data = torch.load(data_file)
     dual_data = DualDataset.post_processing(dual_data, 'Synthetic')
-
-    net = DualGNN_Fusion()
-    y = net(dual_data)
-
-
 
     total_params = sum(p.numel() for p in conv.parameters())
     print(F"{total_params:} total parameters")

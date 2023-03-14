@@ -1,22 +1,19 @@
-import os
-import sys
-import glob
+import os, sys, glob
 from tqdm import tqdm
 import numpy as np
 import openmesh as om
-import data_util
 import torch
 import torch_geometric
 from torch_geometric.utils import to_undirected, add_self_loops
 from torch_geometric.data import Data, Batch
-import torch_geometric.nn.pool.voxel_grid
-# from torch_geometric.utils import remove_self_loops, add_remaining_self_loops, softmax, geodesic_distance, degree
-# from torch_geometric.transforms import SamplePoints, GridSampling
-# from torch_geometric.data import Dataset, DataLoader, ClusterData
+import data_util
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_DIR = os.path.join(BASE_DIR, 'data')
+
+CODE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = os.path.dirname(CODE_DIR)
+DATASET_DIR = os.path.join(BASE_DIR, 'dataset')
 LOG_DIR = os.path.join(BASE_DIR, 'log')
+IS_DEBUG = getattr(sys, 'gettrace', None) is not None and sys.gettrace()
 
 
 class Collater(object):
@@ -76,8 +73,8 @@ class DualDataset(torch_geometric.data.Dataset):
     def __init__(self, data_type, train_or_test='train', data_list_txt=None,
                  filter_patch_count=0, submesh_size=sys.maxsize, transform=None):
         self.data_type = data_type
-        self.root_dir = os.path.join(DATA_DIR, data_type)
-        self.data_dir = os.path.join(DATA_DIR, data_type, train_or_test)  # train or test
+        self.root_dir = os.path.join(DATASET_DIR, data_type)
+        self.data_dir = os.path.join(DATASET_DIR, data_type, train_or_test)  # train or test
         self.filter_patch_count = filter_patch_count
         self.submesh_size = submesh_size
         self.processed_folder = "processed_data"
@@ -94,6 +91,11 @@ class DualDataset(torch_geometric.data.Dataset):
         else:
             data_list = glob.glob(os.path.join(original_dir, "*.obj"))
             data_list = [os.path.basename(d)[:-4] for d in data_list]
+
+        if IS_DEBUG:
+            # data_list = data_list[:2]
+            pass
+
         for name in data_list:
             files_n = glob.glob(os.path.join(noisy_dir, F"{name}_n*.obj"))
             for name_n in files_n:
@@ -274,34 +276,6 @@ class DualDataset(torch_geometric.data.Dataset):
         return DualDataset.post_processing(dual_data, self.data_type)
 
 
-class MultiDataset(torch_geometric.data.Dataset):
-    def __init__(self, dataset_list):
-        super(MultiDataset, self).__init__()
-        self.dataset_list = dataset_list
-        self.dataset_start = []
-        self.dataset_count = []
-        for ds in dataset_list:
-            if len(self.dataset_start) > 0:
-                self.dataset_start.append(self.dataset_start[-1] + self.dataset_count[-1])
-            else:
-                self.dataset_start.append(0)
-            self.dataset_count.append(len(ds))
-
-    def len(self):
-        return sum(self.dataset_count)
-
-    def get(self, idx):
-        dataset_idx, item_idx = self.get_idx(idx)
-        return self.dataset_list[dataset_idx].get(item_idx)
-
-    def get_idx(self, idx):
-        for data_idx, start in enumerate(self.dataset_start):
-            if idx < start:
-                data_idx -= 1
-                break
-        return data_idx, idx - self.dataset_start[data_idx]
-
-
 def process_GT_Kinect_Fusion(noisy_dir, original_dir, filtered_dir):
     result_dir = os.path.join(filtered_dir, 'GT_file')
     os.makedirs(result_dir, exist_ok=True)
@@ -363,7 +337,6 @@ def process_GT_Kinect_Fusion(noisy_dir, original_dir, filtered_dir):
 
 
 if __name__ == "__main__":
-
     torch.manual_seed(1)
 
     train_dataset = DualDataset("Kinect_v2", 'train')
@@ -387,53 +360,3 @@ if __name__ == "__main__":
     process_GT_Kinect_Fusion(noisy_dir, original_dir, filtered_dir)
     exit()
 
-
-    ts_pkl = R"E:\code\python\Facet_Graph_Convolution\Preprocessed_Data\trainingSet.pkl"
-    vs_pkl = R"E:\code\python\Facet_Graph_Convolution\Preprocessed_Data\validSet.pkl"
-    # dataset = RandomSplitDataset('Synthetic', "train_list-AA.txt", submesh_size=50000, transform=RandomRotate(False))
-    # dataset = DualDataset('Synthetic', data_list_txt="train_list-AA.txt", submesh_size=20000, transform=RandomRotate(False))
-    dataset1 = DualDataset('Kinect_v2', 'test', submesh_size=20000, filter_patch_count=100, transform=RandomRotate(False))
-    dataset3 = DualDataset('Kinect_v2', 'train', data_list_txt="train_list-AA.txt", submesh_size=100000, transform=RandomRotate(False))
-
-    two_dataset = MultiDataset([dataset1, dataset2, dataset1, dataset2])
-
-    for i, data in enumerate(two_dataset):
-        pass
-        if isinstance(data, Data):
-            print(len(data), end=', ')
-        elif isinstance(data, tuple):
-            # print(F"{data[0]['name']}:{data[0].num_nodes}, {data[1]['name']}:{data[1].num_nodes}")
-            data = data[0]
-            x = data.x[:, :3]
-            y = data.y[:, :3]
-            err = x - y
-            err = (err**2).sum(1)**0.5
-            print(F"{data['name']}:{data.num_nodes}, err_mean:{err.mean():.6f}, err_max:{err.max():.6f}, err_min:{err.min():.6f}")
-
-
-
-    train_loader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=Collater([]))
-    for epoch in range(2):
-        for idx, data in enumerate(train_loader):
-            if isinstance(data, Batch):
-                print(len(data), end=', ')
-            elif isinstance(data, tuple):
-                print(F"{data[0]['name']}:{data[0].num_nodes}, {data[1]['name']}:{data[1].num_nodes}")
-                data_v = data[0]
-                data_f = data[1]
-                pass
-
-    # data_fp = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'data', 'ShapeNet')
-    # category = ['Airplane', 'Bag']
-    # train_dataset = ShapeNet(data_fp, category)
-    # train_dataset.shuffle()
-    # train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
-    # for idx, data in enumerate(train_loader):
-    #     print("---")
-    #     print(data.num_nodes)
-
-    # obj_file = R"E:\code\python\denoising\TempNet\data\Synthetic\noisy\plane-sphere-n1.obj"
-    # mesh = MeshGraph(obj_file)
-    # face_patch_idx = mesh.get_face_patch(10194, 50)
-
-    # print("--- dataset end ---")

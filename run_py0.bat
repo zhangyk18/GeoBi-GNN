@@ -7,10 +7,3 @@ python test_dual.py --params_path=E:\code\python\denoising\TempNet\log\Bi-GNN_Ki
 
 
 pause
-7.333
-7.5654
-7.8179
-8.1889
-8.7321
-9.3745
-10.2648

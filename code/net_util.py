@@ -3,10 +3,9 @@ import torch.nn.functional as F
 from torch.nn import Linear, Parameter, init
 import torch_geometric
 from torch_geometric.nn import graclus
-from torch_geometric.nn.inits import glorot, zeros
 from torch_geometric.nn.pool.consecutive import consecutive_cluster
 from torch_geometric.nn.pool.pool import pool_pos
-from torch_geometric.utils import to_undirected, remove_self_loops, add_self_loops, add_remaining_self_loops, softmax
+from torch_geometric.utils import to_undirected, remove_self_loops, add_self_loops
 from torch_sparse import coalesce
 from torch_scatter import scatter
 import data_util
@@ -43,58 +42,6 @@ def batch_quat_to_rotmat(q, out=None, normalize=True):
     return out
 
 
-# ===========================================================================
-# << Graph Attention Convolution for Point Cloud Semantic Segmentation >>
-class GACConv(torch_geometric.nn.conv.MessagePassing):
-    def __init__(self, in_channels: int, out_channels: int, add_self: bool = True, bias: bool = True, alpha: float = 0, **kwargs):
-        super(GACConv, self).__init__(aggr='add', **kwargs)
-
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.add_self = add_self
-        self.alpha = alpha
-
-        self.weight = Parameter(torch.Tensor(in_channels, out_channels))
-        self.a = Parameter(torch.Tensor(3+out_channels, out_channels))
-
-        if bias:
-            self.bias = Parameter(torch.Tensor(out_channels))
-        else:
-            self.register_parameter('bias', None)
-
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        glorot(self.weight)
-        glorot(self.a)
-        zeros(self.bias)
-
-    def forward(self, x, edge_index, xyz):
-        if self.add_self:
-            edge_index, edge_weight = add_remaining_self_loops(edge_index, num_nodes=x.shape[0])
-
-        x = torch.matmul(x, self.weight)
-
-        out = self.propagate(edge_index, x=x, xyz=xyz)
-
-        if self.bias is not None:
-            out += self.bias
-
-        return out
-
-    def message(self, x_i, x_j, xyz_i, xyz_j, index, size_i):
-        delta_p = xyz_i - xyz_j
-        delta_h = x_i - x_j
-        delta_p_concat_h = torch.cat([delta_p, delta_h], dim=-1)
-        e = F.leaky_relu(torch.matmul(delta_p_concat_h, self.a), self.alpha, inplace=True)
-        attention = softmax(e, index, num_nodes=size_i)  # the internal implementation is equivalent to common form
-        # test = scatter(attention, index, dim=0, dim_size=size_i, reduce='sum')
-        return x_j * attention
-
-    def __repr__(self):
-        return '{}({}, {})'.format(self.__class__.__name__, self.in_channels, self.out_channels)
-
-
 def plot_wei(wei):
     import numpy as np
     import matplotlib.pyplot as plt
@@ -110,7 +57,6 @@ class PoolingLayer(torch.nn.Module):
     def __init__(self, in_channel, pool_type='max', pool_step=2, edge_weight_type=0, wei_param=2):
         super(PoolingLayer, self).__init__()
         assert (pool_type in ['max', 'mean'])
-        self.negative_slope = 0.2
         self.pool_type = pool_type
         self.pool_step = pool_step
         self.edge_weight_type = edge_weight_type
@@ -122,8 +68,6 @@ class PoolingLayer(torch.nn.Module):
             # attention based edge weight for Graclus pooling
             self.att_l = Parameter(torch.Tensor(1, in_channel))
             self.att_r = Parameter(torch.Tensor(1, in_channel))
-            # glorot(self.att_l)
-            # glorot(self.att_r)
             init.xavier_uniform_(self.att_l.data, gain=1.414)
             init.xavier_uniform_(self.att_r.data, gain=1.414)
 
