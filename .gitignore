@@ -1,0 +1,7 @@
+*.pyc
+
+dataset/
+!dataset/*/train_list.txt
+!dataset/*/test_list.txt
+
+log/
